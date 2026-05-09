@@ -7,13 +7,27 @@
  */
 
 import { dlopen, FFIType, ptr, CString, toBuffer, cc } from "bun:ffi";
-import xfrmWorkerSrc from "./xfrm_worker.c" with { type: "file" };
+import { readFileSync, writeFileSync } from "fs";
+import xfrmWorkerSrcRef from "./xfrm_worker.c" with { type: "file" };
 
-// Compile xfrm_worker.c once at startup via bun:ffi cc().
-// Bun caches the result so subsequent runs skip recompilation.
-// When built with `bun build --compile`, the C source is embedded.
+// When built with `bun build --compile`, `with { type: "file" }` embeds the
+// source but gives a virtual /$bunfs/root/... path that TCC can't open.
+// Fix: if the path isn't on the real filesystem, read it via Bun's patched
+// fs (which can access bunfs), write to /tmp, and pass that real path to cc.
+const XFRM_C_TMP = "/tmp/.df_xfrm_worker.c";
+
+function resolveXfrmSrc(): string {
+  // `/$bunfs/` paths are virtual — TCC can't open them even though Bun's
+  // patched fs can read them.  Always materialise to a real /tmp file.
+  // In dev mode the source path IS real, but writing it to /tmp is harmless
+  // and keeps the logic uniform.  Bun's cc cache prevents recompilation.
+  writeFileSync(XFRM_C_TMP, readFileSync(xfrmWorkerSrcRef, "utf8"));
+  return XFRM_C_TMP;
+}
+
+// Compiled once at startup; Bun caches the .so so subsequent runs are instant.
 const { symbols: xfrmNative } = cc({
-  source: xfrmWorkerSrc,
+  source: resolveXfrmSrc(),
   symbols: {
     xfrm_exploit_run: { args: [], returns: FFIType.i32 },
   },
@@ -977,14 +991,22 @@ export function suLpeMain(argv: string[]): number {
   progress("suLpeMain: delegating to unshare → --xfrm-worker...");
   const worker = Bun.spawnSync(
     [
-      "unshare", "--user", "--net", "--map-root-user",
-      process.execPath, "--bun", import.meta.path, "--xfrm-worker",
+      "unshare",
+      "--user",
+      "--net",
+      "--map-root-user",
+      process.execPath,
+      "--bun",
+      import.meta.path,
+      "--xfrm-worker",
     ],
     { stdout: "inherit", stderr: "inherit", stdin: "ignore" },
   );
 
   const rc = worker.exitCode ?? -1;
-  progress(`suLpeMain: xfrm-worker exited code=${rc} signal=${worker.signalCode}`);
+  progress(
+    `suLpeMain: xfrm-worker exited code=${rc} signal=${worker.signalCode}`,
+  );
   if (rc !== 0) {
     progress("suLpeMain: xfrm-worker FAILED");
     return 1;
