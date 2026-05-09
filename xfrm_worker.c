@@ -249,9 +249,9 @@ static int verify_byte(const char *path, off_t offset, uint8_t want)
     return (n == 1 && got == want) ? 0 : -1;
 }
 
-/* ── main ─────────────────────────────────────────────────────────────────── */
+/* ── exported entry point (called via bun:ffi cc()) ──────────────────────── */
 
-int main(void)
+int xfrm_exploit_run(void)
 {
     LOG("uid=%u euid=%u", getuid(), geteuid());
 
